@@ -1,184 +1,117 @@
 import streamlit as st
 import torch
-import pandas as pd
-from transformers import (
-    DistilBertForSequenceClassification,
-    AlbertForSequenceClassification,
-    RobertaForSequenceClassification,
-    BertForSequenceClassification,
-    DistilBertTokenizer,
-    AlbertTokenizer,
-    RobertaTokenizer,
-    BertTokenizer
-)
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
+import torch.nn as nn
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, AlbertTokenizer, AlbertForSequenceClassification, RobertaTokenizer, RobertaForSequenceClassification
 
-class CombinedEmotionDataset(Dataset):
-    def __init__(self, df, tokenizer):
-        self.df = df
-        self.tokenizer = tokenizer
-    
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, index):
-        text = self.df.iloc[index]['text']
+selected_emotions = ['Anger', 'Fear', 'Joy', 'Sadness', 'Surprise']
+# Define classes
+class EnsembleModel(nn.Module):
+    def __init__(self, num_labels, num_models):
+        super(EnsembleModel, self).__init__()
+        self.classifier = nn.Linear(num_labels * num_models, num_labels)
         
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=128,
-            return_token_type_ids=False,
-            padding='max_length',
-            return_attention_mask=True,
-            return_tensors='pt',
-            truncation=True
-        )
-        
-        item = {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-        }
-        
-        return item
+    def forward(self, model_outputs):
+        logits = self.classifier(model_outputs)
+        return logits
 
-def predict(model, texts, tokenizer):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    dataset = CombinedEmotionDataset(texts, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=16)
+def ensemble_predict(ensemble_model, models, tokenizers, texts, device, max_len=128):
+    ensemble_model.eval()
+    for model in models:
+        model.eval()
     
-    predictions = []
-    
-    model.eval()
     with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            
+        model_outputs = []
+        for model, tokenizer in zip(models, tokenizers):
+            encodings = tokenizer(texts, truncation=True, padding=True, max_length=max_len, return_tensors="pt")
+            input_ids = encodings['input_ids'].to(device)
+            attention_mask = encodings['attention_mask'].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits
-            probs = torch.sigmoid(logits)
-            predictions.extend(probs.cpu().numpy())
+            model_outputs.append(torch.sigmoid(logits))
+        
+        model_outputs = torch.cat(model_outputs, dim=1)
+        ensemble_logits = ensemble_model(model_outputs)
+        probs = torch.sigmoid(ensemble_logits).cpu().numpy()
     
-    return np.array(predictions)
+    return probs
 
-@st.cache_resource
-def load_models():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    distilbert_model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=5)
-    distilbert_model.load_state_dict(torch.load('backend/final_distilbert_model.pth', map_location=device))
+def load_models(sequential=True):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    albert_model = AlbertForSequenceClassification.from_pretrained('albert-base-v2', num_labels=5)
-    albert_model.load_state_dict(torch.load('backend/final_albert_model.pth', map_location=device))
+    if sequential:
+        # Paths to the model weights for the sequential loading
+        distilbert_path = './backend/final_distilbert_model.pth'
+        albert_path = './backend/final_albert_model.pth'
+        roberta_path = './backend/final_roberta_model.pth'
+        
+        # Initialize the models
+        distilbert_model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=len(selected_emotions)).to(device)
+        albert_model = AlbertForSequenceClassification.from_pretrained('albert-base-v2', num_labels=len(selected_emotions)).to(device)
+        roberta_model = RobertaForSequenceClassification.from_pretrained('roberta-base', num_labels=len(selected_emotions)).to(device)
+
+        # Load the state dicts
+        distilbert_model.load_state_dict(torch.load(distilbert_path))
+        albert_model.load_state_dict(torch.load(albert_path))
+        roberta_model.load_state_dict(torch.load(roberta_path))
+        
+    else:
+        # Paths for the parallel loading
+        distilbert_path = './distilbert_emotion_model'
+        albert_path = './albert_emotion_model'
+        roberta_path = './roberta_emotion_model'
     
-    roberta_model = RobertaForSequenceClassification.from_pretrained('roberta-base', num_labels=5)
-    roberta_model.load_state_dict(torch.load('backend/final_roberta_model.pth', map_location=device))
+        distilbert_model = DistilBertForSequenceClassification.from_pretrained(distilbert_path).to(device)
+        albert_model = AlbertForSequenceClassification.from_pretrained(albert_path).to(device)
+        roberta_model = RobertaForSequenceClassification.from_pretrained(roberta_path).to(device)
+
+    # Load tokenizers
+    distilbert_tokenizer = DistilBertTokenizer.from_pretrained(distilbert_path if not sequential else 'distilbert-base-uncased')
+    albert_tokenizer = AlbertTokenizer.from_pretrained(albert_path if not sequential else 'albert-base-v2')
+    roberta_tokenizer = RobertaTokenizer.from_pretrained(roberta_path if not sequential else 'roberta-base')
     
-    final_bert_model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=5)
-    final_bert_model.load_state_dict(torch.load('backend/final_bert_model.pth', map_location=device))
+    return [distilbert_model, albert_model, roberta_model], [distilbert_tokenizer, albert_tokenizer, roberta_tokenizer]
 
-    distilbert_tokenizer = DistilBertTokenizer.from_pretrained('backend/final_distilbert_tokenizer')
-    albert_tokenizer = AlbertTokenizer.from_pretrained('backend/final_albert_tokenizer')
-    roberta_tokenizer = RobertaTokenizer.from_pretrained('backend/final_roberta_tokenizer')
-    bert_tokenizer = BertTokenizer.from_pretrained('backend/final_bert_tokenizer')
+# Streamlit UI
+st.title("Emotion Classification with Ensemble Models")
 
-    return (
-        distilbert_model, albert_model, roberta_model, final_bert_model,
-        distilbert_tokenizer, albert_tokenizer, roberta_tokenizer, bert_tokenizer
-    )
+# Model selection
+model_choice = st.radio("Select Model Type:", options=["Parallel", "Sequential"])
+sequential = model_choice == "Sequential"
 
-def main():
-    # Set page configuration
-    st.set_page_config(page_title="Emotion Analysis App", layout="wide")
+# Load models
+st.write("Loading models...")
+models, tokenizers = load_models(sequential)
+selected_emotions = ['Anger', 'Fear', 'Joy', 'Sadness', 'Surprise']
+ensemble_model = EnsembleModel(len(selected_emotions), 3).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    # Custom CSS for gradient background and styling
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background: linear-gradient(to right, #000000, #434343);  /* Gradient from black to dark gray */
-            color: white;  /* Change text color for better visibility */
-        }
-        .input-box {
-            background-color: rgba(255, 255, 255, 0.8);
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        .results-box {
-            background-color: rgba(255, 255, 255, 0.8);
-            border-radius: 10px;
-            padding: 20px;
-        }
-        .footer {
-            position: fixed;
-            left: 0;
-            bottom: 0;
-            width: 100%;
-            background-color: rgba(0, 0, 0, 0.7);
-            color: white;
-            text-align: center;
-            padding: 10px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+st.success("Models loaded successfully!")
 
-    st.title("Emotion Analysis App")
+# Input text
+input_method = st.radio("Input Method:", ["Predefined Text", "Custom Text"])
 
-    # Load models
-    (distilbert_model, albert_model, roberta_model, final_bert_model,
-     distilbert_tokenizer, albert_tokenizer, roberta_tokenizer, bert_tokenizer) = load_models()
+if input_method == "Predefined Text":
+    test_texts = [
+        "The rollercoaster of emotions I experienced during the movie's climax left me breathless, tears streaming down my face even as I smiled at the bittersweet resolution.",
+        "As I stood atop the mountain, gazing at the vast expanse before me, I felt a mix of exhilaration and trepidation, my heart racing with the thrill of accomplishment and the fear of the descent ahead.",
+        "The unexpected news of my promotion filled me with a paradoxical blend of joy and anxiety, as I celebrated my success while grappling with the weight of new responsibilities.",
+        "Watching the sunset over the ocean, I was overcome by a profound sense of peace tinged with a melancholic awareness of life's transient nature.",
+        "The heated argument with my best friend left me feeling a tumultuous mix of anger, regret, and a desperate hope for reconciliation."
+    ]
+    selected_text = st.selectbox("Choose a text:", test_texts)
+else:
+    selected_text = st.text_area("Enter your text here:", "Type something...")
 
-    # Text input
-    with st.container():
-        st.markdown('<div class="input-box">', unsafe_allow_html=True)
-        text = st.text_area("Enter text for emotion analysis:", height=150)
-        analyze_button = st.button("Analyze")
-        st.markdown('</div>', unsafe_allow_html=True)
+# Prediction button
+if st.button("Predict"):
+    if selected_text.strip():
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        predictions = ensemble_predict(ensemble_model, models, tokenizers, [selected_text], device)
 
-    if analyze_button:
-        if text:
-            # Create DataFrame
-            df = pd.DataFrame({'text': [text]})
+        st.write(f"**Predictions for the text:**")
+        st.write(selected_text)
 
-            # Get predictions from each model
-            distilbert_preds = predict(distilbert_model, df, distilbert_tokenizer)
-            albert_preds = predict(albert_model, df, albert_tokenizer)
-            roberta_preds = predict(roberta_model, df, roberta_tokenizer)
-
-            # Add predictions to the DataFrame
-            df['DistilBERT_Predictions'] = distilbert_preds.tolist()
-            df['ALBERT_Predictions'] = albert_preds.tolist()
-
-            # Get final predictions from BERT
-            final_preds = predict(final_bert_model, df, bert_tokenizer)
-
-            # Display results without percentage scores
-            st.markdown('<div class="results-box">', unsafe_allow_html=True)
-            st.subheader("Emotion Analysis Results:")
-            
-            emotion_labels = ['Anger', 'Fear', 'Joy', 'Sadness', 'Surprise']
-            
-            for emotion_label, score in zip(emotion_labels, final_preds[0]):
-                if score > 0.5:  # Threshold for positive prediction (you can adjust this value)
-                    st.write(f"{emotion_label}: Yes")
-                else:
-                    st.write(f"{emotion_label}: No")
-            
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.warning("Please enter some text for analysis.")
-
-    # Footer with copyright notice
-    st.markdown(
-        '<div class="footer">© 2024 Vedant Patil. All rights reserved.</div>',
-        unsafe_allow_html=True
-    )
-
-if __name__ == "__main__":
-    main()
+        st.write("### Emotion Predictions:")
+        for emotion, prob in zip(selected_emotions, predictions[0]):
+            st.write(f"{emotion}: {prob:.4f} ({'Yes' if prob > 0.5 else 'No'})")
+    else:
+        st.warning("Please enter some text or choose a predefined option.")
